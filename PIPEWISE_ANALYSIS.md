@@ -4,7 +4,6 @@
 
 `Pipewise` 是一个围绕 `pandas.DataFrame` 构建的轻量数据处理管道类。它的核心目标不是替代 `pandas`，而是把“按列声明输入、按步骤串联处理、自动回写结果列”的逻辑封装成统一的注册式流水线，减少业务代码里重复的列选择、逐行处理和中间结果管理。
 
-当前项目代码集中在 [core.py](/Users/xiaoyuyu/Documents/work/dev/datapipe/pipewise/core.py)，已经具备一个可直接使用的最小可用版本。
 
 ## 2. 主要功能
 
