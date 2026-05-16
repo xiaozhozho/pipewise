@@ -6,6 +6,10 @@ class PipewiseRegistrationError(PipewiseError):
     """Raised when a task or schema is registered with invalid metadata."""
 
 
+class PipewiseTaskSelectionError(PipewiseError):
+    """Raised when run(task=...) cannot resolve a unique registered task."""
+
+
 class PipewiseSchemaError(PipewiseError):
     """Base class for schema validation failures."""
 

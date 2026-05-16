@@ -12,6 +12,7 @@ from pipewise.errors import (
     PipewiseInputSchemaError,
     PipewiseOutputSchemaError,
     PipewiseRegistrationError,
+    PipewiseTaskSelectionError,
 )
 
 
@@ -185,6 +186,49 @@ class PipewiseTestCase(unittest.TestCase):
         self.assertEqual(pipewise.tasks, [("step2", ["c"], None, True)])
         pipewise.clear()
         self.assertEqual(pipewise.tasks, [])
+
+    def test_run_specific_task_only(self):
+        df = pd.DataFrame({"a": [1, 2, 3]})
+        pipewise = Pipewise(df)
+
+        @pipewise.register(outputs="b")
+        def step1(a):
+            return a * 2
+
+        @pipewise.register(outputs="c")
+        def step2(a):
+            return a + 100
+
+        result = pipewise.run(task="step2")
+
+        self.assertEqual(list(result.columns), ["a", "c"])
+        self.assertEqual(result["c"].tolist(), [101, 102, 103])
+
+    def test_run_specific_task_missing_name(self):
+        df = pd.DataFrame({"a": [1, 2, 3]})
+        pipewise = Pipewise(df)
+
+        @pipewise.register(outputs="b")
+        def step1(a):
+            return a * 2
+
+        with self.assertRaises(PipewiseTaskSelectionError):
+            pipewise.run(task="step_missing")
+
+    def test_run_specific_task_requires_unique_name(self):
+        df = pd.DataFrame({"a": [1, 2, 3]})
+        pipewise = Pipewise(df)
+
+        @pipewise.register(outputs="b")
+        def duplicate(a):
+            return a * 2
+
+        @pipewise.register(outputs="c")
+        def duplicate(a):
+            return a + 10
+
+        with self.assertRaises(PipewiseTaskSelectionError):
+            pipewise.run(task="duplicate")
 
     def test_plan_output(self):
         df = pd.DataFrame({"a": [1, 2, 3]})

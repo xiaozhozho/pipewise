@@ -13,6 +13,7 @@ from .errors import (
     PipewiseOutputAssignmentError,
     PipewiseOutputSchemaError,
     PipewiseRegistrationError,
+    PipewiseTaskSelectionError,
     PipewiseTypeConversionError,
 )
 
@@ -113,10 +114,17 @@ class Pipewise:
         )
         return func
 
-    def run(self, inplace: bool = False) -> pd.DataFrame:
+    def run(
+        self,
+        inplace: bool = False,
+        task: Optional[str] = None,
+    ) -> pd.DataFrame:
         """
         Execute all registered functions in order and return the modified
         DataFrame.
+
+        When ``task`` is provided, only the uniquely matching registered task
+        is executed. This is useful for faster debugging of a single step.
         """
         data = self.data if inplace else self.data.copy()
         self._validate_frame_schema(
@@ -126,8 +134,11 @@ class Pipewise:
             exc_cls=PipewiseInputSchemaError,
         )
 
+        tasks_to_run = self._select_tasks(task)
         snapshot = data.copy()
-        iterator = _tqdm(self._tasks, ncols=60, colour="green") if _tqdm else self._tasks
+        iterator = (
+            _tqdm(tasks_to_run, ncols=60, colour="green") if _tqdm else tasks_to_run
+        )
         current_task_name = None
 
         try:
@@ -141,6 +152,27 @@ class Pipewise:
             raise PipewiseExecutionError(current_task_name) from exc
 
         return data
+
+    def _select_tasks(self, task_name: Optional[str]) -> List[dict]:
+        if task_name is None:
+            return self._tasks
+
+        if not isinstance(task_name, str) or not task_name:
+            raise PipewiseTaskSelectionError(
+                "run(task=...) expects a non-empty task name string."
+            )
+
+        matches = [task for task in self._tasks if task["func_name"] == task_name]
+        if not matches:
+            raise PipewiseTaskSelectionError(
+                f"No registered task named '{task_name}' was found."
+            )
+        if len(matches) > 1:
+            raise PipewiseTaskSelectionError(
+                f"Task name '{task_name}' is ambiguous; register tasks with unique "
+                "function names to run them individually."
+            )
+        return matches
 
     @property
     def tasks(self) -> List[Tuple[str, Any, Any, bool]]:

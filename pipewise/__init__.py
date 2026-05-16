@@ -13,6 +13,7 @@ from .errors import (
     PipewiseOutputSchemaError,
     PipewiseRegistrationError,
     PipewiseSchemaError,
+    PipewiseTaskSelectionError,
     PipewiseTypeConversionError,
 )
 
@@ -30,6 +31,7 @@ __all__ = [
     "PipewiseOutputSchemaError",
     "PipewiseRegistrationError",
     "PipewiseSchemaError",
+    "PipewiseTaskSelectionError",
     "PipewiseTypeConversionError",
     "__version__",
     "__author__",
