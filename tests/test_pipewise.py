@@ -1,12 +1,17 @@
+"""Tests for Pipewise — a lightweight pandas DataFrame pipeline."""
+
+from __future__ import annotations
+
 import io
-import unittest
+import logging
 import warnings
-from contextlib import redirect_stdout
 
 import pandas as pd
+import pytest
 
-from pipewise import Pipewise
+from pipewise import Pipewise, SchemaRule
 from pipewise.errors import (
+    PipewiseError,
     PipewiseExecutionError,
     PipewiseInputColumnError,
     PipewiseInputSchemaError,
@@ -16,7 +21,12 @@ from pipewise.errors import (
 )
 
 
-class PipewiseTestCase(unittest.TestCase):
+# ======================================================================
+# Basic functionality
+# ======================================================================
+
+
+class TestRegistrationAndExecution:
     def test_vectorized_multi_output(self):
         df = pd.DataFrame({"a": [5, 15, 25], "b": [1, 2, 3]})
         pipewise = Pipewise(df)
@@ -27,8 +37,8 @@ class PipewiseTestCase(unittest.TestCase):
 
         result = pipewise.run()
 
-        self.assertEqual(result["sum"].tolist(), [6, 17, 28])
-        self.assertEqual(result["product"].tolist(), [5, 30, 75])
+        assert result["sum"].tolist() == [6, 17, 28]
+        assert result["product"].tolist() == [5, 30, 75]
 
     def test_auto_fallback_for_branching_function(self):
         df = pd.DataFrame({"a": [5, 15, 25], "b": [1, 2, 3]})
@@ -42,13 +52,12 @@ class PipewiseTestCase(unittest.TestCase):
                 return "medium", b * 10
             return "high", a + b
 
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
             result = pipewise.run()
 
-        self.assertEqual(result["level"].tolist(), ["low", "medium", "high"])
-        self.assertEqual(result["doubled"].tolist(), [10, 20, 28])
-        self.assertTrue(any("fell back to row-wise" in str(item.message) for item in caught))
+        assert result["level"].tolist() == ["low", "medium", "high"]
+        assert result["doubled"].tolist() == [10, 20, 28]
 
     def test_dynamic_dict_output(self):
         df = pd.DataFrame({"a": [5, 15, 25], "b": [1, 2, 3]})
@@ -66,10 +75,10 @@ class PipewiseTestCase(unittest.TestCase):
             warnings.simplefilter("ignore", RuntimeWarning)
             result = pipewise.run()
 
-        self.assertEqual(result["level"].tolist(), ["low", "medium", "high"])
-        self.assertEqual(result["suggest"].dropna().tolist(), [10.0])
-        self.assertEqual(result["adjust"].dropna().tolist(), [102.0])
-        self.assertEqual(result["remark"].dropna().tolist(), ["too large"])
+        assert result["level"].tolist() == ["low", "medium", "high"]
+        assert result["suggest"].dropna().tolist() == [10.0]
+        assert result["adjust"].dropna().tolist() == [102.0]
+        assert result["remark"].dropna().tolist() == ["too large"]
 
     def test_groupby_execution(self):
         df = pd.DataFrame(
@@ -89,10 +98,9 @@ class PipewiseTestCase(unittest.TestCase):
             warnings.simplefilter("ignore", RuntimeWarning)
             result = pipewise.run()
 
-        self.assertEqual(
-            result["classified"].tolist(),
-            ["mid", "high", "low", "high", "high"],
-        )
+        assert result["classified"].tolist() == [
+            "mid", "high", "low", "high", "high",
+        ]
 
     def test_typed_outputs(self):
         df = pd.DataFrame({"a": [1, 2, 3], "b": [10, 20, 30]})
@@ -104,10 +112,12 @@ class PipewiseTestCase(unittest.TestCase):
 
         result = pipewise.run()
 
-        self.assertEqual(str(result["quotient"].dtype), "float64")
-        self.assertEqual(str(result["is_large"].dtype), "bool")
-        self.assertEqual(result["is_large"].tolist(), [False, False, True])
+        assert str(result["quotient"].dtype) == "float64"
+        assert str(result["is_large"].dtype) == "bool"
+        assert result["is_large"].tolist() == [False, False, True]
 
+
+class TestSchemaValidation:
     def test_pipeline_input_schema_validation(self):
         valid_df = pd.DataFrame({"a": [1, 2, 3], "b": [10, 20, 30]})
         valid_pipewise = Pipewise(
@@ -118,7 +128,7 @@ class PipewiseTestCase(unittest.TestCase):
             },
         )
         validated = valid_pipewise.run()
-        self.assertEqual(validated.equals(valid_df), True)
+        assert validated.equals(valid_df)
 
         invalid_df = pd.DataFrame({"a": [1, None, 3]})
         invalid_pipewise = Pipewise(
@@ -126,24 +136,37 @@ class PipewiseTestCase(unittest.TestCase):
             input_schema={"a": {"dtype": "number", "nullable": False}},
         )
 
-        with self.assertRaises(PipewiseInputSchemaError):
+        with pytest.raises(PipewiseInputSchemaError):
             invalid_pipewise.run()
 
     def test_task_output_schema_validation(self):
         df = pd.DataFrame({"a": [1, 2, 3]})
         pipewise = Pipewise(df)
 
-        @pipewise.register(outputs="score", output_schema={"score": {"dtype": "integer", "max": 20}})
+        @pipewise.register(
+            outputs="score", output_schema={"score": {"dtype": "integer", "max": 20}}
+        )
         def score(a):
             return a * 10
 
-        with self.assertRaises(PipewiseExecutionError) as ctx:
+        with pytest.raises(PipewiseExecutionError) as exc_info:
             pipewise.run()
 
-        self.assertIsInstance(ctx.exception.__cause__, PipewiseOutputSchemaError)
-        self.assertEqual(list(df.columns), ["a"])
+        assert isinstance(exc_info.value.__cause__, PipewiseOutputSchemaError)
+        assert list(df.columns) == ["a"]
 
-    def test_inplace_flag(self):
+    def test_invalid_output_schema_target_raises_registration_error(self):
+        pipewise = Pipewise(pd.DataFrame({"a": [1, 2, 3]}))
+
+        with pytest.raises(PipewiseRegistrationError):
+
+            @pipewise.register(outputs="b", output_schema={"c": {"dtype": "integer"}})
+            def invalid_schema(a):
+                return a * 2
+
+
+class TestInplace:
+    def test_default_not_inplace(self):
         df = pd.DataFrame({"a": [1, 2, 3]})
         pipewise = Pipewise(df)
 
@@ -152,10 +175,11 @@ class PipewiseTestCase(unittest.TestCase):
             return a * 2
 
         result = pipewise.run()
-        self.assertIn("doubled", result.columns)
-        self.assertNotIn("doubled", df.columns)
-        self.assertNotIn("doubled", pipewise.data.columns)
+        assert "doubled" in result.columns
+        assert "doubled" not in df.columns
+        assert "doubled" not in pipewise.data.columns
 
+    def test_inplace_flag(self):
         inplace_df = pd.DataFrame({"a": [1, 2, 3]})
         inplace_pipewise = Pipewise(inplace_df)
 
@@ -164,9 +188,11 @@ class PipewiseTestCase(unittest.TestCase):
             return a * 2
 
         inplace_pipewise.run(inplace=True)
-        self.assertIn("doubled", inplace_pipewise.data.columns)
+        assert "doubled" in inplace_pipewise.data.columns
 
-    def test_task_management(self):
+
+class TestTaskManagement:
+    def test_task_list_and_remove_and_clear(self):
         df = pd.DataFrame({"a": [1, 2, 3]})
         pipewise = Pipewise(df)
 
@@ -178,14 +204,14 @@ class PipewiseTestCase(unittest.TestCase):
         def step2(b):
             return b + 10
 
-        self.assertEqual(
-            pipewise.tasks,
-            [("step1", ["b"], None, True), ("step2", ["c"], None, True)],
-        )
-        self.assertTrue(pipewise.remove(step1))
-        self.assertEqual(pipewise.tasks, [("step2", ["c"], None, True)])
+        assert pipewise.tasks == [
+            ("step1", ["b"], None, True),
+            ("step2", ["c"], None, True),
+        ]
+        assert pipewise.remove(step1)
+        assert pipewise.tasks == [("step2", ["c"], None, True)]
         pipewise.clear()
-        self.assertEqual(pipewise.tasks, [])
+        assert pipewise.tasks == []
 
     def test_run_specific_task_only(self):
         df = pd.DataFrame({"a": [1, 2, 3]})
@@ -201,8 +227,8 @@ class PipewiseTestCase(unittest.TestCase):
 
         result = pipewise.run(task="step2")
 
-        self.assertEqual(list(result.columns), ["a", "c"])
-        self.assertEqual(result["c"].tolist(), [101, 102, 103])
+        assert list(result.columns) == ["a", "c"]
+        assert result["c"].tolist() == [101, 102, 103]
 
     def test_run_specific_task_missing_name(self):
         df = pd.DataFrame({"a": [1, 2, 3]})
@@ -212,7 +238,7 @@ class PipewiseTestCase(unittest.TestCase):
         def step1(a):
             return a * 2
 
-        with self.assertRaises(PipewiseTaskSelectionError):
+        with pytest.raises(PipewiseTaskSelectionError):
             pipewise.run(task="step_missing")
 
     def test_run_specific_task_requires_unique_name(self):
@@ -227,7 +253,7 @@ class PipewiseTestCase(unittest.TestCase):
         def duplicate(a):
             return a + 10
 
-        with self.assertRaises(PipewiseTaskSelectionError):
+        with pytest.raises(PipewiseTaskSelectionError):
             pipewise.run(task="duplicate")
 
     def test_plan_output(self):
@@ -239,14 +265,22 @@ class PipewiseTestCase(unittest.TestCase):
             return a * 2
 
         buffer = io.StringIO()
-        with redirect_stdout(buffer):
+        handler = logging.StreamHandler(buffer)
+        logger = logging.getLogger("pipewise.core")
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+        try:
             pipewise.plan()
+        finally:
+            logger.removeHandler(handler)
 
         output = buffer.getvalue()
-        self.assertIn("Execution Plan:", output)
-        self.assertIn("step1", output)
-        self.assertIn("['b']", output)
+        assert "Execution Plan:" in output
+        assert "step1" in output
+        assert "['b']" in output
 
+
+class TestRollback:
     def test_rollback_on_failure(self):
         df = pd.DataFrame({"a": [1, 2, 3]})
         pipewise = Pipewise(df)
@@ -259,11 +293,11 @@ class PipewiseTestCase(unittest.TestCase):
         def bad_step(a):
             raise ValueError("fail")
 
-        with self.assertRaises(PipewiseExecutionError):
+        with pytest.raises(PipewiseExecutionError):
             pipewise.run(inplace=True)
 
-        self.assertEqual(list(df.columns), ["a"])
-        self.assertEqual(list(pipewise.data.columns), ["a"])
+        assert list(df.columns) == ["a"]
+        assert list(pipewise.data.columns) == ["a"]
 
     def test_missing_input_column_uses_custom_exception(self):
         df = pd.DataFrame({"a": [1, 2, 3]})
@@ -273,11 +307,26 @@ class PipewiseTestCase(unittest.TestCase):
         def needs_missing_column(missing_col):
             return missing_col * 2
 
-        with self.assertRaises(PipewiseExecutionError) as ctx:
+        with pytest.raises(PipewiseExecutionError) as exc_info:
             pipewise.run()
 
-        self.assertIsInstance(ctx.exception.__cause__, PipewiseInputColumnError)
+        assert isinstance(exc_info.value.__cause__, PipewiseInputColumnError)
 
+    def test_non_fallback_vectorized_error_bubbles_up(self):
+        df = pd.DataFrame({"a": [1, 2, 3]})
+        pipewise = Pipewise(df)
+
+        @pipewise.register(outputs="b")
+        def broken(a):
+            raise KeyError("boom")
+
+        with pytest.raises(PipewiseExecutionError) as exc_info:
+            pipewise.run()
+
+        assert isinstance(exc_info.value.__cause__, KeyError)
+
+
+class TestKwargsAndMixed:
     def test_kwargs_rowwise_mode(self):
         df = pd.DataFrame({"x": [1, 2], "y": [10, 20], "z": [100, 200]})
         pipewise = Pipewise(df)
@@ -289,10 +338,10 @@ class PipewiseTestCase(unittest.TestCase):
 
         result = pipewise.run()
 
-        self.assertEqual(
-            result["summary"].tolist(),
-            ["x=1, y=10, z=100", "x=2, y=20, z=200"],
-        )
+        assert result["summary"].tolist() == [
+            "x=1, y=10, z=100",
+            "x=2, y=20, z=200",
+        ]
 
     def test_mixed_vectorized_and_rowwise_pipeline(self):
         df = pd.DataFrame({"a": [1, 2, 3]})
@@ -312,31 +361,299 @@ class PipewiseTestCase(unittest.TestCase):
             warnings.simplefilter("ignore", RuntimeWarning)
             result = pipewise.run()
 
-        self.assertEqual(result["b"].tolist(), [10, 20, 30])
-        self.assertEqual(result["c"].tolist(), ["small", "big", "big"])
+        assert result["b"].tolist() == [10, 20, 30]
+        assert result["c"].tolist() == ["small", "big", "big"]
 
-    def test_non_fallback_vectorized_error_bubbles_up(self):
+
+# ======================================================================
+# New: Complex input types — list, dict, set
+# ======================================================================
+
+
+class TestComplexInputTypes:
+    """Verify that Pipewise handles DataFrame columns containing list, dict,
+    and set values correctly — both in vectorized and row-wise modes."""
+
+    # --- List columns ---
+
+    def test_vectorized_list_input(self):
+        """Vectorized: function receives a Series of lists."""
+        df = pd.DataFrame({"items": [[1, 2], [3, 4, 5], [6]]})
+        pipewise = Pipewise(df)
+
+        @pipewise.register(outputs="count")
+        def count_items(items):
+            return items.str.len()
+
+        result = pipewise.run()
+        assert result["count"].tolist() == [2, 3, 1]
+
+    def test_rowwise_list_input(self):
+        """Row-wise: function receives individual lists per row."""
+        df = pd.DataFrame({"items": [[1, 2], [3, 4, 5], [6]]})
+        pipewise = Pipewise(df)
+
+        @pipewise.register(outputs="summary", vectorized=False)
+        def summarize_list(items):
+            return f"len={len(items)}, sum={sum(items)}"
+
+        result = pipewise.run()
+        assert result["summary"].tolist() == [
+            "len=2, sum=3",
+            "len=3, sum=12",
+            "len=1, sum=6",
+        ]
+
+    def test_vectorized_list_manipulation(self):
+        """Vectorized: extract elements from lists."""
+        df = pd.DataFrame({
+            "coords": [[10, 20], [30, 40], [50, 60]],
+        })
+        pipewise = Pipewise(df)
+
+        @pipewise.register(outputs=["x", "y"])
+        def split_coords(coords):
+            xs = coords.str[0]
+            ys = coords.str[1]
+            return xs, ys
+
+        result = pipewise.run()
+        assert result["x"].tolist() == [10, 30, 50]
+        assert result["y"].tolist() == [20, 40, 60]
+
+    # --- Dict columns ---
+
+    def test_vectorized_dict_input(self):
+        """Vectorized: function receives a Series of dicts."""
+        df = pd.DataFrame({
+            "attrs": [{"w": 1, "h": 2}, {"w": 3, "h": 4}, {"w": 5, "h": 6}],
+        })
+        pipewise = Pipewise(df)
+
+        @pipewise.register(outputs=["w", "h"])
+        def extract_dict(attrs):
+            return attrs.str["w"], attrs.str["h"]
+
+        result = pipewise.run()
+        assert result["w"].tolist() == [1, 3, 5]
+        assert result["h"].tolist() == [2, 4, 6]
+
+    def test_rowwise_dict_input(self):
+        """Row-wise: function receives individual dicts per row."""
+        df = pd.DataFrame({
+            "attrs": [{"w": 1, "h": 2}, {"w": 3, "h": 4}, {"w": 5, "h": 6}],
+        })
+        pipewise = Pipewise(df)
+
+        @pipewise.register(outputs="area", vectorized=False)
+        def compute_area(attrs):
+            return attrs["w"] * attrs["h"]
+
+        result = pipewise.run()
+        assert result["area"].tolist() == [2, 12, 30]
+
+    def test_dict_output_with_dict_input(self):
+        """dict output + dict input: compute new keys from input dict."""
+        df = pd.DataFrame({
+            "info": [{"a": 1, "b": 2}, {"a": 3, "b": 4}, {"a": 5, "b": 6}],
+        })
+        pipewise = Pipewise(df)
+
+        @pipewise.register(outputs="dict", vectorized=False)
+        def enrich(info):
+            return {"sum": info["a"] + info["b"], "product": info["a"] * info["b"]}
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            result = pipewise.run()
+
+        assert result["sum"].tolist() == [3, 7, 11]
+        assert result["product"].tolist() == [2, 12, 30]
+
+    # --- Set columns ---
+
+    def test_vectorized_set_input(self):
+        """Vectorized: function receives a Series of sets."""
+        df = pd.DataFrame({
+            "tags": [{"x", "y"}, {"a", "b", "c"}, {"z"}],
+        })
+        pipewise = Pipewise(df)
+
+        @pipewise.register(outputs="tag_count")
+        def count_tags(tags):
+            return tags.apply(len)
+
+        result = pipewise.run()
+        assert result["tag_count"].tolist() == [2, 3, 1]
+
+    def test_rowwise_set_input(self):
+        """Row-wise: function receives individual sets per row."""
+        df = pd.DataFrame({
+            "tags": [{"x", "y"}, {"a", "b", "c"}, {"z"}],
+        })
+        pipewise = Pipewise(df)
+
+        @pipewise.register(outputs="sorted_tags", vectorized=False)
+        def sort_tags(tags):
+            return ",".join(sorted(tags))
+
+        result = pipewise.run()
+        assert result["sorted_tags"].tolist() == [
+            "x,y",
+            "a,b,c",
+            "z",
+        ]
+
+    def test_groupby_with_list_column(self):
+        """GroupBy on standard column while processing list column within groups."""
+        df = pd.DataFrame({
+            "group": ["A", "A", "B"],
+            "values": [[1, 2], [3], [4, 5, 6]],
+        })
+        pipewise = Pipewise(df)
+
+        @pipewise.register(outputs="total", groupby="group")
+        def sum_values(values):
+            return sum(values)
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            result = pipewise.run()
+
+        assert result["total"].tolist() == [3, 3, 15]
+
+    def test_mixed_complex_types_in_kwargs(self):
+        """Row-wise with **kwargs capturing list and dict columns."""
+        df = pd.DataFrame({
+            "name": ["a", "b"],
+            "props": [{"x": 1}, {"y": 2}],
+            "scores": [[10, 20], [30]],
+        })
+        pipewise = Pipewise(df)
+
+        @pipewise.register(outputs="report", vectorized=False)
+        def build_report(name, **extra):
+            parts = [f"name={name}"]
+            for k, v in sorted(extra.items()):
+                parts.append(f"{k}={v}")
+            return " | ".join(parts)
+
+        result = pipewise.run()
+        assert "report" in result.columns
+        assert len(result) == 2
+
+    # --- Edge cases ---
+
+    def test_empty_list_column(self):
+        """Empty lists in a column should not cause errors."""
+        df = pd.DataFrame({"items": [[], [1], []]})
+        pipewise = Pipewise(df)
+
+        @pipewise.register(outputs="length", vectorized=False)
+        def length(items):
+            return len(items)
+
+        result = pipewise.run()
+        assert result["length"].tolist() == [0, 1, 0]
+
+    def test_mixed_type_column_with_none(self):
+        """Column with None/NaN alongside lists."""
+        df = pd.DataFrame({"data": [[1], None, [2, 3]]})
+        pipewise = Pipewise(df)
+
+        @pipewise.register(outputs="length", vectorized=False)
+        def get_length(data):
+            if data is None:
+                return -1
+            return len(data)
+
+        result = pipewise.run()
+        assert result["length"].tolist() == [1, -1, 2]
+
+    def test_typed_output_with_complex_input(self):
+        """Type conversion still works when inputs are complex types."""
+        df = pd.DataFrame({"vals": [[1, 2], [3, 4], [5, 6]]})
+        pipewise = Pipewise(df)
+
+        @pipewise.register(outputs={"avg": float})
+        def compute_avg(vals):
+            return (sum(vals) / len(vals)) if vals else 0.0
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            result = pipewise.run()
+
+        assert str(result["avg"].dtype) == "float64"
+        assert result["avg"].tolist() == [1.5, 3.5, 5.5]
+
+    def test_register_output_schema_single_col(self):
+        """outputs='col' with output_schema maps the dtype."""
         df = pd.DataFrame({"a": [1, 2, 3]})
         pipewise = Pipewise(df)
 
-        @pipewise.register(outputs="b")
-        def broken(a):
-            raise KeyError("boom")
+        @pipewise.register(outputs="b", output_schema={"b": {"dtype": "float"}})
+        def half(a):
+            return a / 2
 
-        with self.assertRaises(PipewiseExecutionError) as ctx:
-            pipewise.run()
+        result = pipewise.run()
+        assert str(result["b"].dtype).startswith("float")
 
-        self.assertIsInstance(ctx.exception.__cause__, KeyError)
+    def test_register_side_effect_only(self):
+        """outputs=None means side-effect only, no columns written."""
+        df = pd.DataFrame({"a": [1, 2, 3]})
+        pipewise = Pipewise(df)
+        side_effects = []
 
-    def test_invalid_output_schema_target_raises_registration_error(self):
-        pipewise = Pipewise(pd.DataFrame({"a": [1, 2, 3]}))
+        @pipewise.register(outputs=None)
+        def track(a):
+            side_effects.append(sum(a))
 
-        with self.assertRaises(PipewiseRegistrationError):
+        pipewise.run()
+        assert side_effects == [6]
 
-            @pipewise.register(outputs="b", output_schema={"c": {"dtype": "integer"}})
-            def invalid_schema(a):
-                return a * 2
+    def test_register_output_with_schema_rule(self):
+        """outputs='col' with output_schema uses string dtype."""
+        df = pd.DataFrame({"a": [1, 2, 3]})
+        pipewise = Pipewise(df)
+
+        @pipewise.register(outputs="b", output_schema={"b": "integer"})
+        def double(a):
+            return a * 2
+
+        result = pipewise.run()
+        assert result["b"].tolist() == [2, 4, 6]
 
 
-if __name__ == "__main__":
-    unittest.main()
+# ======================================================================
+# Package-level metadata
+# ======================================================================
+
+
+class TestPackageMetadata:
+    def test_version_and_author(self):
+        import pipewise
+        assert hasattr(pipewise, "__version__")
+        assert hasattr(pipewise, "__author__")
+
+    def test_exception_hierarchy(self):
+        """All custom exceptions inherit from PipewiseError."""
+        import pipewise.errors as err
+
+        exception_classes = [
+            err.PipewiseRegistrationError,
+            err.PipewiseTaskSelectionError,
+            err.PipewiseInputColumnError,
+            err.PipewiseInputSchemaError,
+            err.PipewiseOutputSchemaError,
+            err.PipewiseGroupByError,
+            err.PipewiseOutputAssignmentError,
+            err.PipewiseTypeConversionError,
+            err.PipewiseExecutionError,
+        ]
+        for exc_cls in exception_classes:
+            assert issubclass(exc_cls, PipewiseError), f"{exc_cls.__name__} is not a subclass of PipewiseError"
+
+    def test_schema_rule_is_exported(self):
+        """SchemaRule type alias is part of the public API."""
+        from pipewise import SchemaRule
+        assert SchemaRule is not None

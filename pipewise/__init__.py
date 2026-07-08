@@ -3,6 +3,7 @@ Pipewise public package interface.
 """
 
 from .core import Pipewise
+from ._schema import SchemaRule
 from .errors import (
     PipewiseError,
     PipewiseExecutionError,
@@ -22,6 +23,7 @@ __author__ = "XiaoZhouZhou"
 
 __all__ = [
     "Pipewise",
+    "SchemaRule",
     "PipewiseError",
     "PipewiseExecutionError",
     "PipewiseGroupByError",
