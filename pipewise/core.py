@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import ast
 import inspect
 import logging
+import textwrap
+import warnings
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
@@ -78,19 +81,20 @@ class Pipewise:
         func:
             The function to register (or ``None`` for bare decorator usage).
         outputs:
-            Output column specification. See ``_normalize_outputs`` for accepted
-            forms.
+            Output column specification. Accepted forms:
+            ``None`` (side-effect only), ``"col"`` (single column),
+            ``["c1", "c2"]`` (multi-column), ``{"col": type}`` (typed),
+            or ``"dict"`` (dynamic dict output).
         groupby:
             Column name(s) to group by before executing the function.
         vectorized:
-            If ``True``, the function receives entire pandas ``Series`` as arguments.
+            If ``True``, the function receives whole ``Series`` objects.
         input_schema:
             Schema rules for input columns.
         output_schema:
             Schema rules for output columns.
         fallback_on_vectorized_error:
-            If ``True`` and vectorized execution fails with a known error, fall
-            back to row-wise execution.
+            If ``True`` and vectorized execution fails, fall back to row-wise.
         """
         if func is None:
             return lambda f: self.register(
@@ -102,6 +106,9 @@ class Pipewise:
                 output_schema=output_schema,
                 fallback_on_vectorized_error=fallback_on_vectorized_error,
             )
+
+        if vectorized:
+            _warn_if_vectorized_hazard(func)
 
         col_names, type_map, dict_mode = _normalize_outputs(outputs)
         normalized_input_schema = normalize_schema(input_schema, "input_schema")
@@ -153,8 +160,7 @@ class Pipewise:
         Parameters
         ----------
         inplace:
-            If ``True``, modify the internal DataFrame directly instead of
-            returning a copy.
+            If ``True``, modify the internal DataFrame directly.
         task:
             Name of a single task to execute.
         """
@@ -301,10 +307,19 @@ class Pipewise:
                 return
             except Exception as exc:
                 if _should_fallback(task_def, exc):
-                    logger.debug(
-                        "Function '%s' fell back to row-wise (vectorized failed: %s)",
+                    logger.info(
+                        "Function '%s' fell back to row-wise execution because "
+                        "vectorized execution is incompatible: %s: %s",
                         task_def["func_name"],
+                        type(exc).__name__,
                         exc,
+                    )
+                    warnings.warn(
+                        f"Function '{task_def['func_name']}' fell back to row-wise "
+                        f"execution because vectorized execution is incompatible: "
+                        f"{type(exc).__name__}: {exc}",
+                        RuntimeWarning,
+                        stacklevel=2,
                     )
                 else:
                     raise
@@ -533,14 +548,15 @@ def _parse_inputs(func):
 def _should_fallback(task_def: dict, exc: Exception) -> bool:
     """Decide whether vectorized *exc* should trigger a row-wise fallback.
 
-    Falls back only when the task allows it and the exception is a
-    :class:`TypeError` or a :class:`ValueError` — the two exception types
-    pandas raises when an operation is incompatible with a ``Series``
-    (e.g. ``if series < 0`` raises ``ValueError: truth value ambiguous``).
+    Falls back when the task allows it and the exception is one of the common
+    types raised when a function is incompatible with pandas ``Series``:
+    :class:`TypeError` (e.g. ``if series < 0``), :class:`ValueError`
+    (e.g. ``truth value ambiguous``), or :class:`AttributeError`
+    (e.g. ``sc.split(',')`` where *sc* is a Series, not a scalar).
     """
     if not task_def["fallback_on_vectorized_error"]:
         return False
-    return isinstance(exc, (TypeError, ValueError))
+    return isinstance(exc, (TypeError, ValueError, AttributeError))
 
 
 def _rollback(data: pd.DataFrame, snapshot: pd.DataFrame) -> None:
@@ -550,6 +566,163 @@ def _rollback(data: pd.DataFrame, snapshot: pd.DataFrame) -> None:
         data.drop(columns=cols_to_remove, inplace=True)
     for col in snapshot.columns:
         data[col] = snapshot[col].copy()
+
+
+# ======================================================================
+# AST-based vectorized-hazard detection
+# ======================================================================
+
+_VECTORIZED_HAZARD_PATTERNS: Dict[str, str] = {
+    "Call@len": (
+        "`len(%s)` returns the number of rows when applied to a Series, "
+        "not the length of each element. Use `.str.len()` (vectorized) or "
+        "`vectorized=False` (row-wise)."
+    ),
+    "Call@isinstance": (
+        "`isinstance(%s, ...)` always returns `False` when applied to a Series. "
+        "Use `vectorized=False` to check each element individually."
+    ),
+    "Call@type": (
+        "`type(%s)` returns `pandas.core.series.Series` when applied to a Series, "
+        "not the type of each element. Use `vectorized=False` for per-element checks."
+    ),
+    "Call@.split": (
+        "`%s.split(...)` raises AttributeError on a Series — use `.str.split()` "
+        "(vectorized) or `vectorized=False` (row-wise)."
+    ),
+    "Call@.strip": (
+        "`%s.strip(...)` raises AttributeError on a Series — use `.str.strip()` "
+        "(vectorized) or `vectorized=False` (row-wise)."
+    ),
+    "Call@.lower": (
+        "`%s.lower()` raises AttributeError on a Series — use `.str.lower()` "
+        "(vectorized) or `vectorized=False` (row-wise)."
+    ),
+    "Call@.upper": (
+        "`%s.upper()` raises AttributeError on a Series — use `.str.upper()` "
+        "(vectorized) or `vectorized=False` (row-wise)."
+    ),
+    "Subscript@int": (
+        "`%s[0]` on a Series does label-based indexing, not per-element access. "
+        "Use `.str[0]` (vectorized) or `vectorized=False` (row-wise)."
+    ),
+    "Subscript@str": (
+        "`%s['key']` on a Series does label-based indexing, not dict-access per "
+        "element. Use `.str['key']` (vectorized) or `vectorized=False` (row-wise)."
+    ),
+}
+
+
+def _warn_if_vectorized_hazard(func: Callable) -> None:
+    """Scan *func*'s source for common vectorized-incompatible patterns.
+
+    Emits ``logger.warning`` if any hazard is found.
+    """
+    try:
+        source = textwrap.dedent(inspect.getsource(func))
+    except (OSError, TypeError):
+        return  # can't inspect (e.g. built-in / C extension) — skip
+
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return
+
+    detector = _VectorizedHazardVisitor()
+    detector.visit(tree)
+
+    for (category, name), detail in sorted(detector.hazards.items()):
+        msg = _VECTORIZED_HAZARD_PATTERNS[category] % name
+        if detail:
+            msg = f"{msg} (detected: `{detail}`)"
+        logger.warning(
+            "Function '%s' may be vectorized-incompatible: %s",
+            func.__name__,
+            msg,
+        )
+
+
+class _VectorizedHazardVisitor(ast.NodeVisitor):
+    """Walk the AST and record vectorized-incompatible patterns."""
+
+    def __init__(self):
+        self.hazards: Dict[Tuple[str, str], Optional[str]] = {}  # (category, name) → detail
+
+    def _record(self, category: str, name: str, detail: Optional[str] = None) -> None:
+        if category not in _VECTORIZED_HAZARD_PATTERNS:
+            return
+        # deduplicate by (category, name)
+        if (category, name) not in self.hazards:
+            self.hazards[(category, name)] = detail
+
+    # --- Call patterns ---
+
+    def _visit_call_by_name(self, node: ast.Call, func_name: str) -> None:
+        """Called when we see `func_name(...)`."""
+        # len(x)
+        if func_name == "len" and node.args:
+            arg = node.args[0]
+            if isinstance(arg, ast.Name):
+                self._record("Call@len", arg.id)
+        # isinstance(x, ...)
+        elif func_name == "isinstance" and node.args:
+            arg = node.args[0]
+            if isinstance(arg, ast.Name):
+                self._record("Call@isinstance", arg.id)
+        # type(x)
+        elif func_name == "type" and node.args:
+            arg = node.args[0]
+            if isinstance(arg, ast.Name):
+                self._record("Call@type", arg.id)
+
+    def visit_Call(self, node: ast.Call) -> None:
+        # Direct name call: len(x), isinstance(x), type(x)
+        if isinstance(node.func, ast.Name):
+            self._visit_call_by_name(node, node.func.id)
+
+        # Attribute method call: obj.split(), obj.strip(), etc.
+        if isinstance(node.func, ast.Attribute):
+            method_name = node.func.attr
+            # Only flag known string scalar methods
+            for suffix, category in [
+                ("split", "Call@.split"),
+                ("strip", "Call@.strip"),
+                ("lower", "Call@.lower"),
+                ("upper", "Call@.upper"),
+            ]:
+                if method_name == suffix:
+                    # Capture the expression text as best-effort detail
+                    detail = _expr_source(node)
+                    if isinstance(node.func.value, ast.Name):
+                        self._record(category, node.func.value.id, detail)
+                    break
+
+        self.generic_visit(node)
+
+    # --- Subscript patterns ---
+
+    def visit_Subscript(self, node: ast.Subscript) -> None:
+        # obj[0] — int constant subscript
+        if isinstance(node.value, ast.Name):
+            var_name = node.value.id
+            if isinstance(node.slice, ast.Constant) and isinstance(node.slice.value, int):
+                self._record("Subscript@int", var_name, f"{var_name}[{node.slice.value}]")
+            elif isinstance(node.slice, ast.Index):  # Python < 3.9 compat
+                inner = node.slice.value
+                if isinstance(inner, ast.Constant) and isinstance(inner.value, int):
+                    self._record("Subscript@int", var_name, f"{var_name}[{inner.value}]")
+            elif isinstance(node.slice, ast.Constant) and isinstance(node.slice.value, str):
+                self._record("Subscript@str", var_name, f"{var_name}['{node.slice.value}']")
+
+        self.generic_visit(node)
+
+
+def _expr_source(node: ast.AST) -> Optional[str]:
+    """Return a short source representation of *node*, best-effort."""
+    try:
+        return ast.unparse(node)
+    except Exception:
+        return None
 
 
 # ---- Output assignment helpers (shared by vectorized & row-wise) ----
@@ -563,6 +736,7 @@ def _assign_dict_output(
     """Assign dict/DataFrame results back to *data*."""
     func_name = task_def["func_name"]
     if isinstance(result, pd.DataFrame):
+        result = _align_result_index(result, data.index)
         for col in result.columns:
             data[col] = result[col]
         return
@@ -581,26 +755,37 @@ def _assign_columns(
     result: Any,
     task_def: dict,
 ) -> None:
-    """Assign a tuple/list/DataFrame result to declared output columns."""
+    """Assign a tuple/list/DataFrame/Series result to declared output columns."""
     col_names = task_def["col_names"]
     func_name = task_def["func_name"]
     type_map = task_def["type_map"]
 
     if not col_names:
         return
+
+    # --- Single output column ---
     if len(col_names) == 1:
-        data[col_names[0]] = result
+        data[col_names[0]] = _safe_values(result, data.index)
         apply_types(data, type_map)
         return
 
+    # --- Multi output column ---
     if isinstance(result, pd.DataFrame):
+        result = _align_result_index(result, data.index)
         if result.shape[1] != len(col_names):
             raise PipewiseOutputAssignmentError(
                 f"Function '{func_name}' returned {result.shape[1]} columns, "
                 f"but outputs specifies {len(col_names)} columns: {col_names}."
             )
         for i, col in enumerate(col_names):
-            data[col] = result.iloc[:, i]
+            data[col] = _safe_values(result.iloc[:, i], data.index)
+    elif isinstance(result, pd.Series):
+        if len(col_names) != 1:
+            raise PipewiseOutputAssignmentError(
+                f"Function '{func_name}' returned a Series, but outputs specifies "
+                f"{len(col_names)} columns: {col_names}."
+            )
+        data[col_names[0]] = _safe_values(result, data.index)
     elif isinstance(result, (list, tuple)):
         if len(result) != len(col_names):
             raise PipewiseOutputAssignmentError(
@@ -608,10 +793,31 @@ def _assign_columns(
                 f"outputs specifies {len(col_names)} columns: {col_names}."
             )
         for i, col in enumerate(col_names):
-            data[col] = result[i]
+            data[col] = _safe_values(result[i], data.index)
     else:
         raise PipewiseOutputAssignmentError(
             f"Function '{func_name}' must return a tuple/list or DataFrame "
             f"for outputs {col_names}."
         )
     apply_types(data, type_map)
+
+
+def _safe_values(value: Any, target_index: pd.Index) -> Any:
+    """Extract values respecting *target_index* alignment.
+
+    - ``pd.Series`` → ``.values`` after index alignment
+    - ``pd.DataFrame`` single column → ``.values``
+    - scalar / list / array → returned as-is
+    """
+    if isinstance(value, pd.Series):
+        return value.reindex(target_index).values
+    if isinstance(value, pd.DataFrame) and value.shape[1] == 1:
+        return value.iloc[:, 0].reindex(target_index).values
+    return value
+
+
+def _align_result_index(result: pd.DataFrame, target_index: pd.Index) -> pd.DataFrame:
+    """Reindex *result* to match *target_index*, without mutating."""
+    if not result.index.equals(target_index):
+        return result.reindex(target_index)
+    return result
