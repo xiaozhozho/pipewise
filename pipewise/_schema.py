@@ -206,7 +206,7 @@ def _check_bound(
 ) -> None:
     try:
         if condition.any():
-            observed = non_null[condition].iloc[0]
+            observed = _display_scalar(non_null[condition].iloc[0])
             raise exc_cls(
                 f"{phase} column '{column}' contains value {observed!r} "
                 f"{direction} {bound_name}={bound_value!r}."
@@ -216,6 +216,21 @@ def _check_bound(
             f"{phase} column '{column}' cannot be compared with "
             f"{bound_name}={bound_value!r}."
         ) from exc
+
+
+def _display_scalar(value: Any) -> Any:
+    """Unwrap a numpy scalar so messages read ``12.0``, not ``np.float64(12.0)``.
+
+    numpy 2.x changed ``repr`` to include the type name, which leaks
+    implementation detail into user-facing error messages.
+    """
+    item = getattr(value, "item", None)
+    if callable(item):
+        try:
+            return item()
+        except (TypeError, ValueError):
+            return value
+    return value
 
 
 def _validate_dtype(
