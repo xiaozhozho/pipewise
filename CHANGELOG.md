@@ -2,6 +2,59 @@
 
 All notable changes to this project will be documented in this file.
 
+## 2.0.0 - 2026-09-12
+
+### Breaking changes
+
+- **Vectorized → row-wise fallback is now opt-in.** `register(...)` defaults to
+  `fallback_on_vectorized_error=False`. Previously an incompatible function was
+  retried row by row; because the vectorized call has already run once, that
+  retry re-executed the function body and could repeat side effects. The failure
+  now surfaces directly with a hint pointing at the fix.
+  **Migration:** pass `fallback_on_vectorized_error=True` (or use
+  `vectorized=False`) to keep the previous behaviour.
+- The class-level schema/rollback delegation methods (`_validate_frame_schema`,
+  `_matches_dtype`, `_validate_dtype`, `_apply_types`, `_rollback`) were unused
+  shims and have been removed.
+
+### Added
+
+- Vectorized-hazard detection now also flags a column parameter used as a branch
+  condition (`if col > 0:`, `if col:`, `x if col else y`).
+- Registration warns when a parameter with a default value shadows a same-named
+  column, which was previously ignored silently.
+- Vectorized functions may return a 2-D `numpy.ndarray` for multi-column output,
+  and an `(n, 1)` array for a single output column.
+- `py.typed` marker (PEP 561) so type checkers see the annotations.
+
+### Changed
+
+- Task metadata is now a `TaskDef` `NamedTuple`; `Pipewise.tasks` returns
+  `TaskSummary` entries (still plain-tuple compatible).
+- Row-wise execution uses `DataFrame.itertuples` instead of
+  `DataFrame.apply(axis=1)` — measured ~5x faster on a 200k-row frame. Row values
+  are now Python-native (`int`/`float`) rather than numpy scalars.
+- Schema validation computes the null-free view of each column once per check.
+- `run(task=...)` now also validates and reports a task's input columns.
+
+### Fixed
+
+- AST hazard detection no longer warns about local variables and helper objects;
+  it only considers actual column inputs.
+- Output-assignment failures (wrong length/shape) are never mistaken for a
+  vectorization incompatibility and no longer trigger a fallback.
+- Ragged row-wise multi-column results raise `PipewiseOutputAssignmentError`
+  naming the offending row, instead of an opaque pandas error.
+- Length-mismatched results raise a clear error instead of being silently
+  broadcast across every row.
+- `run(task=...)` ambiguity message interpolates the task name.
+
+### Internal
+
+- `core.py` split into `_hazards.py`, `_tasks.py`, `_assign.py` and
+  `_execution.py`, leaving `core.py` as the orchestration facade.
+- CI: ruff lint, 80% coverage gate, Python 3.13, and publishing now gated on tests.
+
 ## 1.1.0 - 2026-07-08
 
 ### Added

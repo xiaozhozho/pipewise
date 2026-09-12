@@ -2,8 +2,8 @@
 Pipewise public package interface.
 """
 
-from .core import Pipewise
 from ._schema import SchemaRule
+from .core import Pipewise
 from .errors import (
     PipewiseError,
     PipewiseExecutionError,
@@ -18,7 +18,7 @@ from .errors import (
     PipewiseTypeConversionError,
 )
 
-__version__ = "1.1.0"
+__version__ = "2.0.0"
 __author__ = "XiaoZhouZhou"
 
 __all__ = [

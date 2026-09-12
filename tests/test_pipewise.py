@@ -13,17 +13,17 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from pipewise import Pipewise, SchemaRule
+from pipewise import Pipewise
 from pipewise.errors import (
     PipewiseError,
     PipewiseExecutionError,
     PipewiseInputColumnError,
     PipewiseInputSchemaError,
+    PipewiseOutputAssignmentError,
     PipewiseOutputSchemaError,
     PipewiseRegistrationError,
     PipewiseTaskSelectionError,
 )
-
 
 # ======================================================================
 # Basic functionality
@@ -48,7 +48,9 @@ class TestRegistrationAndExecution:
         df = pd.DataFrame({"a": [5, 15, 25], "b": [1, 2, 3]})
         pipewise = Pipewise(df)
 
-        @pipewise.register(outputs=["level", "doubled"])
+        @pipewise.register(
+            outputs=["level", "doubled"], fallback_on_vectorized_error=True
+        )
         def classify_and_double(a, b):
             if a < 10:
                 return "low", a * 2
@@ -63,11 +65,25 @@ class TestRegistrationAndExecution:
         assert result["level"].tolist() == ["low", "medium", "high"]
         assert result["doubled"].tolist() == [10, 20, 28]
 
+    def test_auto_fallback_can_be_disabled(self):
+        df = pd.DataFrame({"a": [5, 15, 25]})
+        pipewise = Pipewise(df)
+
+        @pipewise.register(outputs="level")
+        def classify(a):
+            if a < 10:
+                return "low"
+            return "high"
+
+        # The default is explicit: no silent retry, the failure surfaces.
+        with pytest.raises(PipewiseExecutionError):
+            pipewise.run()
+
     def test_dynamic_dict_output(self):
         df = pd.DataFrame({"a": [5, 15, 25], "b": [1, 2, 3]})
         pipewise = Pipewise(df)
 
-        @pipewise.register(outputs="dict")
+        @pipewise.register(outputs="dict", fallback_on_vectorized_error=True)
         def smart_update(a, b):
             if a < 10:
                 return {"level": "low", "suggest": a * 2}
@@ -90,7 +106,9 @@ class TestRegistrationAndExecution:
         )
         pipewise = Pipewise(df)
 
-        @pipewise.register(outputs="classified", groupby="group")
+        @pipewise.register(
+            outputs="classified", groupby="group", fallback_on_vectorized_error=True
+        )
         def classify_group(value):
             if value > 12:
                 return "high"
@@ -254,7 +272,7 @@ class TestTaskManagement:
             return a * 2
 
         @pipewise.register(outputs="c")
-        def duplicate(a):
+        def duplicate(a):  # noqa: F811 - intentional same-name registration
             return a + 10
 
         with pytest.raises(PipewiseTaskSelectionError):
@@ -355,7 +373,7 @@ class TestKwargsAndMixed:
         def v_step(a):
             return a * 10
 
-        @pipewise.register(outputs="c")
+        @pipewise.register(outputs="c", fallback_on_vectorized_error=True)
         def r_step(b):
             if b > 15:
                 return "big"
@@ -504,7 +522,9 @@ class TestComplexInputTypes:
         })
         pipewise = Pipewise(df)
 
-        @pipewise.register(outputs="total", groupby="group")
+        @pipewise.register(
+            outputs="total", groupby="group", fallback_on_vectorized_error=True
+        )
         def sum_values(values):
             return sum(values)
 
@@ -563,7 +583,9 @@ class TestComplexInputTypes:
         df = pd.DataFrame({"vals": [[1, 2], [3, 4], [5, 6]]})
         pipewise = Pipewise(df)
 
-        @pipewise.register(outputs={"avg": float})
+        @pipewise.register(
+            outputs={"avg": float}, fallback_on_vectorized_error=True
+        )
         def compute_avg(vals):
             return (sum(vals) / len(vals)) if vals else 0.0
 
@@ -614,7 +636,7 @@ class TestComplexInputTypes:
         df = pd.DataFrame({"sc": ["a,b,c", "b,2,e", "c,3,5"]})
         pipewise = Pipewise(df)
 
-        @pipewise.register(outputs="sc_list")
+        @pipewise.register(outputs="sc_list", fallback_on_vectorized_error=True)
         def proc_string_as_list(sc):
             return sc.split(",")
 
@@ -632,7 +654,7 @@ class TestComplexInputTypes:
         df = pd.DataFrame({"s": ["  hello  ", "  world  "]})
         pipewise = Pipewise(df)
 
-        @pipewise.register(outputs="cleaned")
+        @pipewise.register(outputs="cleaned", fallback_on_vectorized_error=True)
         def trim(s):
             return s.strip()
 
@@ -673,7 +695,7 @@ class TestComplexInputTypes:
         })
         pipewise = Pipewise(df)
 
-        @pipewise.register(outputs="sc_list")
+        @pipewise.register(outputs="sc_list", fallback_on_vectorized_error=True)
         def proc_string_as_list(sc):
             return sc.split(",")
 
@@ -943,7 +965,7 @@ class TestMoreComplexTypes:
         })
         pipewise = Pipewise(df)
 
-        @pipewise.register(outputs="composite")
+        @pipewise.register(outputs="composite", fallback_on_vectorized_error=True)
         def compose(int_col, float_col, str_col, bool_col):
             return (
                 str_col + str(int_col) + str(int(float_col))
@@ -1351,6 +1373,137 @@ class TestVectorizedHazardDetection:
         # Warning should still fire — the hazard is real
         assert any("s.split" in rec.message for rec in caplog.records)
 
+    def test_if_condition_hazard_warning(self, caplog):
+        """Branching on a column parameter is the headline hazard."""
+        df = pd.DataFrame({"a": [5, 15, 25]})
+        pipewise = Pipewise(df)
+
+        caplog.set_level(logging.WARNING, logger="pipewise.core")
+
+        @pipewise.register(outputs="level")
+        def classify(a):
+            if a < 10:
+                return "low"
+            return "high"
+
+        assert any("branch condition" in rec.message for rec in caplog.records)
+
+    def test_bare_truthiness_hazard_warning(self, caplog):
+        df = pd.DataFrame({"flag": [True, False]})
+        pipewise = Pipewise(df)
+
+        caplog.set_level(logging.WARNING, logger="pipewise.core")
+
+        @pipewise.register(outputs="n")
+        def count_true(flag):
+            if flag:
+                return 1
+            return 0
+
+        assert any("branch condition" in rec.message for rec in caplog.records)
+
+    def test_ternary_condition_hazard_warning(self, caplog):
+        df = pd.DataFrame({"a": [1, 2]})
+        pipewise = Pipewise(df)
+
+        caplog.set_level(logging.WARNING, logger="pipewise.core")
+
+        @pipewise.register(outputs="b")
+        def pick(a):
+            return a * 2 if a > 1 else a
+
+        assert any("branch condition" in rec.message for rec in caplog.records)
+
+    def test_local_variables_do_not_warn(self, caplog):
+        """Regression: locals and helper objects must not be mistaken for columns."""
+        df = pd.DataFrame({"a": ["x", "y"]})
+        pipewise = Pipewise(df)
+
+        caplog.set_level(logging.WARNING, logger="pipewise.core")
+
+        @pipewise.register(outputs="b")
+        def uses_locals(a):
+            tag = "TAG"
+            parts = [1, 2, 3]
+            other = "hello"
+            return a.str.upper() + tag.upper() + str(len(parts)) + other.strip()
+
+        assert not any(
+            "may be vectorized-incompatible" in rec.message for rec in caplog.records
+        ), f"Unexpected warnings: {[r.message for r in caplog.records]}"
+
+    def test_returning_comparison_is_not_a_hazard(self, caplog):
+        """A comparison that is *returned* is valid vectorized code."""
+        df = pd.DataFrame({"a": [1, 2, 3]})
+        pipewise = Pipewise(df)
+
+        caplog.set_level(logging.WARNING, logger="pipewise.core")
+
+        @pipewise.register(outputs="big")
+        def is_big(a):
+            return a > 2
+
+        assert not any(
+            "may be vectorized-incompatible" in rec.message for rec in caplog.records
+        ), f"Unexpected warnings: {[r.message for r in caplog.records]}"
+
+    def test_plain_function_no_hazard_warning(self, caplog):
+        df = pd.DataFrame({"a": [1, 2, 3]})
+        pipewise = Pipewise(df)
+
+        caplog.set_level(logging.WARNING, logger="pipewise.core")
+
+        @pipewise.register(outputs="b")
+        def double(a):
+            return a * 2
+
+        assert not any(
+            "may be vectorized-incompatible" in rec.message for rec in caplog.records
+        ), f"Unexpected warnings: {[r.message for r in caplog.records]}"
+
+
+# ======================================================================
+# Shadowed defaults — a defaulted parameter silently ignores a column
+# ======================================================================
+
+
+class TestShadowedDefaultWarning:
+    def test_warns_when_column_is_shadowed(self, caplog):
+        df = pd.DataFrame({"a": [1, 2], "b": [10, 20]})
+        pipewise = Pipewise(df)
+
+        caplog.set_level(logging.WARNING, logger="pipewise.core")
+
+        @pipewise.register(outputs="c")
+        def add(a, b=100):
+            return a + b
+
+        assert any("with a default value" in rec.message for rec in caplog.records)
+
+    def test_no_warning_without_matching_column(self, caplog):
+        df = pd.DataFrame({"a": [1, 2]})
+        pipewise = Pipewise(df)
+
+        caplog.set_level(logging.WARNING, logger="pipewise.core")
+
+        @pipewise.register(outputs="c")
+        def add(a, b=100):
+            return a + b
+
+        assert not any("with a default value" in rec.message for rec in caplog.records)
+
+    def test_default_wins_when_column_is_shadowed(self):
+        df = pd.DataFrame({"a": [1, 2], "b": [10, 20]})
+        pipewise = Pipewise(df)
+
+        @pipewise.register(outputs="c")
+        def add(a, b=100):
+            return a + b
+
+        result = pipewise.run()
+        # The column is ignored; the default wins (documented behaviour).
+        assert result["c"].tolist() == [101, 102]
+
 
 # ======================================================================
 # Package-level metadata
@@ -1385,3 +1538,473 @@ class TestPackageMetadata:
     def test_schema_rule_is_exported(self):
         from pipewise import SchemaRule
         assert SchemaRule is not None
+
+
+# ======================================================================
+# Exotic cell types — numpy arrays, classes, class instances, containers
+# ======================================================================
+
+
+class Point:
+    """Helper object stored inside DataFrame cells."""
+
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
+
+    def __repr__(self):
+        return f"Point({self.x}, {self.y})"
+
+    def __eq__(self, other):
+        return isinstance(other, Point) and (self.x, self.y) == (other.x, other.y)
+
+
+class Sized:
+    """Helper object whose length is defined by ``__len__``."""
+
+    def __init__(self, items):
+        self.items = list(items)
+
+    def __len__(self):
+        return len(self.items)
+
+
+class TestNumpyArrayCells:
+    """A column may hold ``numpy.ndarray`` values rather than scalars."""
+
+    def test_vectorized_ndarray_cell_len(self):
+        df = pd.DataFrame({"v": [np.array([1, 2]), np.array([3, 4, 5])]})
+        pipewise = Pipewise(df)
+
+        @pipewise.register(outputs="n")
+        def count(v):
+            return v.apply(len)
+
+        result = pipewise.run()
+        assert result["n"].tolist() == [2, 3]
+
+    def test_rowwise_ndarray_cell_sum(self):
+        df = pd.DataFrame({"v": [np.array([1, 2]), np.array([3, 4, 5])]})
+        pipewise = Pipewise(df)
+
+        @pipewise.register(outputs="s", vectorized=False)
+        def total(v):
+            return int(v.sum())
+
+        result = pipewise.run()
+        assert result["s"].tolist() == [3, 12]
+
+    def test_ndarray_cell_as_output(self):
+        df = pd.DataFrame({"a": [1, 2]})
+        pipewise = Pipewise(df)
+
+        @pipewise.register(outputs="arr", vectorized=False)
+        def to_array(a):
+            return np.arange(a)
+
+        result = pipewise.run()
+        assert [list(x) for x in result["arr"]] == [[0], [0, 1]]
+
+    def test_ndarray_2d_multi_output(self):
+        df = pd.DataFrame({"a": [1, 2], "b": [3, 4]})
+        pipewise = Pipewise(df)
+
+        @pipewise.register(outputs=["sum", "product"])
+        def calc(a, b):
+            return np.column_stack([a + b, a * b])
+
+        result = pipewise.run()
+        assert result["sum"].tolist() == [4, 6]
+        assert result["product"].tolist() == [3, 8]
+
+    def test_ndarray_2d_single_column(self):
+        df = pd.DataFrame({"a": [1, 2, 3]})
+        pipewise = Pipewise(df)
+
+        @pipewise.register(outputs="doubled")
+        def double(a):
+            return np.column_stack([a * 2])
+
+        result = pipewise.run()
+        assert result["doubled"].tolist() == [2, 4, 6]
+
+    def test_ndarray_2d_wrong_width_for_single_output_raises(self):
+        df = pd.DataFrame({"a": [1, 2]})
+        pipewise = Pipewise(df)
+
+        @pipewise.register(outputs="x")
+        def bad(a):
+            return np.column_stack([a, a])
+
+        with pytest.raises(PipewiseExecutionError) as excinfo:
+            pipewise.run()
+        assert isinstance(excinfo.value.__cause__, PipewiseOutputAssignmentError)
+
+    def test_ndarray_2d_wrong_width_raises(self):
+        df = pd.DataFrame({"a": [1, 2]})
+        pipewise = Pipewise(df)
+
+        @pipewise.register(outputs=["x", "y"])
+        def bad(a):
+            return np.column_stack([a, a, a])
+
+        with pytest.raises(PipewiseExecutionError) as excinfo:
+            pipewise.run()
+        assert isinstance(excinfo.value.__cause__, PipewiseOutputAssignmentError)
+
+    def test_tuple_of_ndarrays_multi_output(self):
+        df = pd.DataFrame({"a": [1, 2, 3]})
+        pipewise = Pipewise(df)
+
+        @pipewise.register(outputs=["lo", "hi"])
+        def bounds(a):
+            a = np.asarray(a)
+            return a, a * 10
+
+        result = pipewise.run()
+        assert result["lo"].tolist() == [1, 2, 3]
+        assert result["hi"].tolist() == [10, 20, 30]
+
+    def test_rowwise_1d_ndarray_to_multi_output(self):
+        df = pd.DataFrame({"a": [1, 2]})
+        pipewise = Pipewise(df)
+
+        @pipewise.register(outputs=["x", "y"], vectorized=False)
+        def expand(a):
+            return np.array([a, a * 10])
+
+        result = pipewise.run()
+        assert result["x"].tolist() == [1, 2]
+        assert result["y"].tolist() == [10, 20]
+
+    def test_empty_dataframe_multi_output(self):
+        df = pd.DataFrame({"a": pd.Series([], dtype=int)})
+
+        vectorized = Pipewise(df)
+
+        @vectorized.register(outputs=["x", "y"])
+        def vec(a):
+            return a + 1, a * 2
+
+        rowwise = Pipewise(df)
+
+        @rowwise.register(outputs=["x", "y"], vectorized=False)
+        def row(a):
+            return a + 1, a * 2
+
+        for pipewise in (vectorized, rowwise):
+            result = pipewise.run()
+            assert len(result) == 0
+            assert list(result.columns) == ["a", "x", "y"]
+
+    def test_input_schema_object_dtype_on_ndarray_column(self):
+        df = pd.DataFrame({"v": [np.array([1, 2]), np.array([3, 4])]})
+        pipewise = Pipewise(df, input_schema={"v": {"dtype": object}})
+
+        @pipewise.register(outputs="n", vectorized=False)
+        def count(v):
+            return len(v)
+
+        result = pipewise.run()
+        assert result["n"].tolist() == [2, 2]
+
+
+class TestClassCells:
+    """Columns may hold class instances or class objects themselves."""
+
+    def test_class_instance_attribute_rowwise(self):
+        df = pd.DataFrame({"pt": [Point(1, 2), Point(3, 4)]})
+        pipewise = Pipewise(df)
+
+        @pipewise.register(outputs="x", vectorized=False)
+        def get_x(pt):
+            return pt.x
+
+        result = pipewise.run()
+        assert result["x"].tolist() == [1, 3]
+
+    def test_class_instance_multi_output(self):
+        df = pd.DataFrame({"pt": [Point(1, 2), Point(3, 4)]})
+        pipewise = Pipewise(df)
+
+        @pipewise.register(outputs=["x", "y"], vectorized=False)
+        def unpack(pt):
+            return pt.x, pt.y
+
+        result = pipewise.run()
+        assert result["x"].tolist() == [1, 3]
+        assert result["y"].tolist() == [2, 4]
+
+    def test_class_instance_as_output_cell(self):
+        df = pd.DataFrame({"pt": [Point(1, 2), Point(3, 4)]})
+        pipewise = Pipewise(df)
+
+        @pipewise.register(outputs="doubled", vectorized=False)
+        def double(pt):
+            return Point(pt.x * 2, pt.y * 2)
+
+        result = pipewise.run()
+        assert result["doubled"].tolist() == [Point(2, 4), Point(6, 8)]
+
+    def test_class_instance_with_output_schema(self):
+        df = pd.DataFrame({"pt": [Point(1, 2), Point(3, 4)]})
+        pipewise = Pipewise(df)
+
+        @pipewise.register(
+            outputs="x",
+            vectorized=False,
+            output_schema={"x": {"dtype": "integer", "min": 0}},
+        )
+        def get_x(pt):
+            return pt.x
+
+        result = pipewise.run()
+        assert result["x"].tolist() == [1, 3]
+
+    def test_class_object_cells(self):
+        df = pd.DataFrame({"cls": [int, float, str]})
+        pipewise = Pipewise(df)
+
+        @pipewise.register(outputs="name", vectorized=False)
+        def class_name(cls):
+            return cls.__name__
+
+        result = pipewise.run()
+        assert result["name"].tolist() == ["int", "float", "str"]
+
+    def test_sized_object_len(self):
+        df = pd.DataFrame({"obj": [Sized([1, 2]), Sized([3])]})
+        pipewise = Pipewise(df)
+
+        @pipewise.register(outputs="n", vectorized=False)
+        def size(obj):
+            return len(obj)
+
+        result = pipewise.run()
+        assert result["n"].tolist() == [2, 1]
+
+    def test_class_instance_column_with_groupby(self):
+        df = pd.DataFrame({
+            "g": ["A", "A", "B"],
+            "pt": [Point(1, 1), Point(2, 2), Point(3, 3)],
+        })
+        pipewise = Pipewise(df)
+
+        @pipewise.register(outputs="x", groupby="g", vectorized=False)
+        def get_x(pt):
+            return pt.x
+
+        result = pipewise.run()
+        assert result["x"].tolist() == [1, 2, 3]
+
+    def test_ndarray_column_with_groupby(self):
+        df = pd.DataFrame({
+            "g": ["A", "A", "B"],
+            "v": [np.array([1, 2]), np.array([3]), np.array([4, 5, 6])],
+        })
+        pipewise = Pipewise(df)
+
+        @pipewise.register(outputs="n", groupby="g", vectorized=False)
+        def count(v):
+            return len(v)
+
+        result = pipewise.run()
+        assert result["n"].tolist() == [2, 1, 3]
+
+
+class TestNestedAndOtherContainers:
+    """Nested containers and the remaining built-in container types."""
+
+    def test_nested_dict_of_lists(self):
+        df = pd.DataFrame({"d": [{"k": [1, 2]}, {"k": [3]}]})
+        pipewise = Pipewise(df)
+
+        @pipewise.register(outputs="n", vectorized=False)
+        def count(d):
+            return len(d["k"])
+
+        result = pipewise.run()
+        assert result["n"].tolist() == [2, 1]
+
+    def test_frozenset_cells(self):
+        df = pd.DataFrame({"fs": [frozenset([1, 2]), frozenset([3])]})
+        pipewise = Pipewise(df)
+
+        @pipewise.register(outputs="n", vectorized=False)
+        def count(fs):
+            return len(fs)
+
+        result = pipewise.run()
+        assert result["n"].tolist() == [2, 1]
+
+    def test_tuple_cells(self):
+        df = pd.DataFrame({"t": [(1, 2), (3, 4)]})
+        pipewise = Pipewise(df)
+
+        @pipewise.register(outputs="s", vectorized=False)
+        def total(t):
+            return sum(t)
+
+        result = pipewise.run()
+        assert result["s"].tolist() == [3, 7]
+
+    def test_set_as_output_cell(self):
+        df = pd.DataFrame({"a": [1, 2]})
+        pipewise = Pipewise(df)
+
+        @pipewise.register(outputs="s", vectorized=False)
+        def make_set(a):
+            return {a, a + 1}
+
+        result = pipewise.run()
+        assert result["s"].tolist() == [{1, 2}, {2, 3}]
+
+    def test_nested_empty_containers(self):
+        df = pd.DataFrame({"d": [{}, {"k": []}], "items": [[], [1]]})
+        pipewise = Pipewise(df)
+
+        @pipewise.register(outputs=["dn", "ln"], vectorized=False)
+        def sizes(d, items):
+            return len(d), len(items)
+
+        result = pipewise.run()
+        assert result["dn"].tolist() == [0, 1]
+        assert result["ln"].tolist() == [0, 1]
+
+
+class TestOutputShapeGuards:
+    """Assignment-phase failures must surface as clear errors and must never be
+    mistaken for a vectorized incompatibility that silently falls back."""
+
+    def test_length_mismatch_single_output_raises(self):
+        df = pd.DataFrame({"a": [1, 2, 3]})
+        pipewise = Pipewise(df)
+
+        @pipewise.register(outputs="x")
+        def bad(a):
+            return [a.sum()]  # one value for three rows
+
+        with pytest.raises(PipewiseExecutionError) as excinfo:
+            pipewise.run()
+        assert isinstance(excinfo.value.__cause__, PipewiseOutputAssignmentError)
+
+    def test_length_mismatch_does_not_silently_fall_back(self):
+        """Regression: a wrong-length vectorized result previously triggered the
+        row-wise fallback and produced per-row values instead of an error."""
+        df = pd.DataFrame({"a": [1, 2, 3]})
+        pipewise = Pipewise(df)
+
+        @pipewise.register(outputs=["x", "y"])
+        def bad(a):
+            return [a.sum()], [a.max()]
+
+        with pytest.raises(PipewiseExecutionError) as excinfo:
+            pipewise.run()
+        assert isinstance(excinfo.value.__cause__, PipewiseOutputAssignmentError)
+
+    def test_ragged_rowwise_multi_output_raises_clear_error(self):
+        df = pd.DataFrame({"a": [1, 2]})
+        pipewise = Pipewise(df)
+
+        @pipewise.register(outputs=["x", "y"], vectorized=False)
+        def ragged(a):
+            if a == 1:
+                return a, a + 1
+            return (a,)
+
+        with pytest.raises(PipewiseExecutionError) as excinfo:
+            pipewise.run()
+        cause = excinfo.value.__cause__
+        assert isinstance(cause, PipewiseOutputAssignmentError)
+        assert "row 1" in str(cause)
+
+    def test_dict_output_wrong_length_raises(self):
+        df = pd.DataFrame({"a": [1, 2, 3]})
+        pipewise = Pipewise(df)
+
+        @pipewise.register(outputs="dict")
+        def bad(a):
+            return {"x": [9]}
+
+        with pytest.raises(PipewiseExecutionError) as excinfo:
+            pipewise.run()
+        assert isinstance(excinfo.value.__cause__, PipewiseOutputAssignmentError)
+
+    def test_scalar_broadcast_still_supported(self):
+        df = pd.DataFrame({"a": [1, 2, 3]})
+        pipewise = Pipewise(df)
+
+        @pipewise.register(outputs="zero")
+        def zero(a):
+            return 0
+
+        result = pipewise.run()
+        assert result["zero"].tolist() == [0, 0, 0]
+
+    def test_correct_length_list_still_accepted(self):
+        df = pd.DataFrame({"a": [1, 2, 3]})
+        pipewise = Pipewise(df)
+
+        @pipewise.register(outputs="y", vectorized=False)
+        def keep(a):
+            return [a] * 3
+
+        result = pipewise.run()
+        assert result["y"].tolist() == [[1, 1, 1], [2, 2, 2], [3, 3, 3]]
+
+
+class TestMixedExoticPipeline:
+    """Exotic cell types must compose across a multi-step pipeline."""
+
+    def test_pipeline_combining_exotic_columns(self):
+        df = pd.DataFrame({
+            "id": [1, 2],
+            "vec": [np.array([1, 2]), np.array([3, 4, 5])],
+            "meta": [{"n": "a"}, {"n": "b"}],
+            "pt": [Point(1, 2), Point(3, 4)],
+        })
+        pipewise = Pipewise(df)
+
+        @pipewise.register(outputs="vec_len", vectorized=False)
+        def vec_len(vec):
+            return len(vec)
+
+        @pipewise.register(outputs="label", vectorized=False)
+        def label(meta):
+            return meta["n"].upper()
+
+        @pipewise.register(outputs=["x", "y"], vectorized=False)
+        def unpack(pt):
+            return pt.x, pt.y
+
+        result = pipewise.run()
+        assert result["vec_len"].tolist() == [2, 3]
+        assert result["label"].tolist() == ["A", "B"]
+        assert result["x"].tolist() == [1, 3]
+        assert result["y"].tolist() == [2, 4]
+        assert list(result.columns) == ["id", "vec", "meta", "pt", "vec_len", "label", "x", "y"]
+
+    def test_exotic_columns_survive_rollback(self):
+        df = pd.DataFrame({
+            "vec": [np.array([1, 2]), np.array([3])],
+            "pt": [Point(1, 1), Point(2, 2)],
+            "n": [0, 0],
+        })
+        pipewise = Pipewise(df)
+
+        @pipewise.register(outputs="ln", vectorized=False)
+        def count(vec):
+            return len(vec)
+
+        @pipewise.register(outputs="boom", vectorized=False)
+        def explode(n):
+            raise RuntimeError("nope")
+
+        with pytest.raises(PipewiseExecutionError):
+            pipewise.run(inplace=True)
+
+        # the added column is rolled back and exotic columns are intact
+        assert list(df.columns) == ["vec", "pt", "n"]
+        assert [list(x) for x in df["vec"]] == [[1, 2], [3]]
+        assert df["pt"].tolist() == [Point(1, 1), Point(2, 2)]
+        assert df["n"].tolist() == [0, 0]

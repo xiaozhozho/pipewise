@@ -104,20 +104,31 @@ def validate_frame_schema(
     phase: str,
     exc_cls,
 ) -> None:
-    """Validate *data* columns against a normalized schema."""
+    """Validate *data* columns against a normalized schema.
+
+    The null-free view of each column is computed once and shared by the
+    individual rule checks, instead of every check dropping nulls again.
+    """
     if not schema:
         return
     for column, rule in schema.items():
         if column not in data.columns:
             raise exc_cls(f"{phase} expects column '{column}', but it is missing.")
         series = data[column]
+        non_null = series.dropna()
         _validate_nullable(series, rule, column, phase, exc_cls)
-        _validate_allowed_values(series, rule, column, phase, exc_cls)
-        _validate_numeric_bounds(series, rule, column, phase, exc_cls)
-        _validate_dtype(series, rule, column, phase, exc_cls)
+        _validate_allowed_values(series, non_null, rule, column, phase, exc_cls)
+        _validate_numeric_bounds(non_null, rule, column, phase, exc_cls)
+        _validate_dtype(series, non_null, rule, column, phase, exc_cls)
 
 
-def _validate_nullable(series: pd.Series, rule: Dict[str, Any], column: str, phase: str, exc_cls) -> None:
+def _validate_nullable(
+    series: pd.Series,
+    rule: Dict[str, Any],
+    column: str,
+    phase: str,
+    exc_cls,
+) -> None:
     if rule.get("nullable", True):
         return
     if series.isna().any():
@@ -126,37 +137,76 @@ def _validate_nullable(series: pd.Series, rule: Dict[str, Any], column: str, pha
         )
 
 
-def _validate_allowed_values(series: pd.Series, rule: Dict[str, Any], column: str, phase: str, exc_cls) -> None:
+def _validate_allowed_values(
+    series: pd.Series,
+    non_null: pd.Series,
+    rule: Dict[str, Any],
+    column: str,
+    phase: str,
+    exc_cls,
+) -> None:
     allowed = rule.get("allowed_values")
     if allowed is None:
         return
-    invalid_mask = ~series.dropna().isin(list(allowed))
+    invalid_mask = ~non_null.isin(list(allowed))
     if invalid_mask.any():
-        invalid_values = series.dropna()[invalid_mask].unique().tolist()
+        invalid_values = non_null[invalid_mask].unique().tolist()
         raise exc_cls(
             f"{phase} column '{column}' contains values outside allowed_values: "
             f"{invalid_values[:5]}."
         )
 
 
-def _validate_numeric_bounds(series: pd.Series, rule: Dict[str, Any], column: str, phase: str, exc_cls) -> None:
-    non_null = series.dropna()
+def _validate_numeric_bounds(
+    non_null: pd.Series,
+    rule: Dict[str, Any],
+    column: str,
+    phase: str,
+    exc_cls,
+) -> None:
     if non_null.empty:
         return
 
     min_value = rule.get("min")
     if min_value is not None:
-        _check_bound(non_null < min_value, series, column, phase, exc_cls, "below", "min", min_value)
+        _check_bound(
+            non_null < min_value,
+            non_null,
+            column,
+            phase,
+            exc_cls,
+            "below",
+            "min",
+            min_value,
+        )
 
     max_value = rule.get("max")
     if max_value is not None:
-        _check_bound(non_null > max_value, series, column, phase, exc_cls, "above", "max", max_value)
+        _check_bound(
+            non_null > max_value,
+            non_null,
+            column,
+            phase,
+            exc_cls,
+            "above",
+            "max",
+            max_value,
+        )
 
 
-def _check_bound(condition, series, column, phase, exc_cls, direction: str, bound_name: str, bound_value) -> None:
+def _check_bound(
+    condition,
+    non_null,
+    column,
+    phase,
+    exc_cls,
+    direction: str,
+    bound_name: str,
+    bound_value,
+) -> None:
     try:
         if condition.any():
-            observed = series[condition].iloc[0]
+            observed = non_null[condition].iloc[0]
             raise exc_cls(
                 f"{phase} column '{column}' contains value {observed!r} "
                 f"{direction} {bound_name}={bound_value!r}."
@@ -168,11 +218,18 @@ def _check_bound(condition, series, column, phase, exc_cls, direction: str, boun
         ) from exc
 
 
-def _validate_dtype(series: pd.Series, rule: Dict[str, Any], column: str, phase: str, exc_cls) -> None:
+def _validate_dtype(
+    series: pd.Series,
+    non_null: pd.Series,
+    rule: Dict[str, Any],
+    column: str,
+    phase: str,
+    exc_cls,
+) -> None:
     expected = rule.get("dtype")
     if expected is None:
         return
-    if matches_dtype(series, expected):
+    if matches_dtype(series, expected, non_null):
         return
     raise exc_cls(
         f"{phase} column '{column}' has dtype {series.dtype}, "
@@ -180,15 +237,23 @@ def _validate_dtype(series: pd.Series, rule: Dict[str, Any], column: str, phase:
     )
 
 
-def matches_dtype(series: pd.Series, expected: SchemaRule) -> bool:
+def matches_dtype(
+    series: pd.Series,
+    expected: SchemaRule,
+    non_null: Optional[pd.Series] = None,
+) -> bool:
     """Check whether *series* dtype satisfies ``expected``.
 
     Accepts a pandas dtype string (``"integer"``, ``"float"``, ``"number"``,
-    ``"bool"``, ``"string"``, ``"datetime"``, or a concrete ``pd.api.types.pandas_dtype``),
-    a Python built-in type (``int``, ``float``, ``bool``, ``str``, ``object``),
-    or a ``tuple`` of Python types.
+    ``"bool"``, ``"string"``, ``"datetime"``, or a concrete
+    ``pd.api.types.pandas_dtype``), a Python built-in type (``int``, ``float``,
+    ``bool``, ``str``, ``object``), or a ``tuple`` of Python types.
+
+    *non_null* may be supplied by callers that already dropped nulls, to avoid
+    recomputing it.
     """
-    non_null = series.dropna()
+    if non_null is None:
+        non_null = series.dropna()
 
     if isinstance(expected, str):
         return _matches_dtype_string(expected.lower(), series, non_null)
@@ -196,7 +261,11 @@ def matches_dtype(series: pd.Series, expected: SchemaRule) -> bool:
     if isinstance(expected, type):
         return _matches_dtype_type(expected, series, non_null)
 
-    if isinstance(expected, tuple) and expected and all(isinstance(item, type) for item in expected):
+    if (
+        isinstance(expected, tuple)
+        and expected
+        and all(isinstance(item, type) for item in expected)
+    ):
         return bool(non_null.map(lambda v: isinstance(v, expected)).all())
 
     return False
@@ -216,7 +285,11 @@ def _matches_dtype_string(expected_lower: str, series: pd.Series, non_null: pd.S
         return bool(
             pd.api.types.is_float_dtype(series)
             or non_null.map(
-                lambda v: isinstance(v, Real) and not isinstance(v, Integral) and not isinstance(v, bool)
+                lambda v: (
+                    isinstance(v, Real)
+                    and not isinstance(v, Integral)
+                    and not isinstance(v, bool)
+                )
             ).all()
         )
     if expected_lower in {"bool", "boolean"}:

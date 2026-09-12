@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pipewise"
-version = "1.1.0"
+version = "2.0.0"
 description = "A lightweight pandas DataFrame pipeline with schema validation and rollback support."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -22,10 +22,23 @@ classifiers = [
   "Programming Language :: Python :: 3.9",
   "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
   "Operating System :: OS Independent",
   "Topic :: Software Development :: Libraries :: Python Modules",
   "Topic :: Scientific/Engineering :: Information Analysis",
+  "Typing :: Typed",
 ]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=7.0",
+  "pytest-cov>=4.0",
+  "ruff>=0.5",
+]
+
+[project.urls]
+Homepage = "https://pypi.org/project/pipewise/"
 
 [tool.setuptools]
 include-package-data = true
@@ -34,7 +47,17 @@ include-package-data = true
 where = ["."]
 include = ["pipewise*"]
 
+[tool.setuptools.package-data]
+pipewise = ["py.typed"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B"]
 
